@@ -1,0 +1,12 @@
+{
+  "network": "arbitrumSepolia",
+  "chainId": 421614,
+  "deployer": "0x7379651E169e63272ec57Ce14f2BfC023e28382E",
+  "contracts": {
+    "COMPToken": "0x24249A523A251E38CB0001daBd54DD44Ea8f1838",
+    "GOVToken": "0xB97eDD49C225d2c43e7203aB9248cAbED2B268d3",
+    "TaskRegistry": "0x4Dc9dD73834E94545cF041091e1A743FBD09a60f",
+    "OARNRegistry": "0xa122518Cb6E66A804fc37EB26c8a7aF309dCF04C"
+  },
+  "deployedAt": "2026-02-18T10:16:26.686Z"
+}
