@@ -43,6 +43,9 @@ const config: HardhatUserConfig = {
     enabled: process.env.REPORT_GAS === "true",
     currency: "USD",
   },
+  sourcify: {
+    enabled: true,
+  },
 };
 
 export default config;
