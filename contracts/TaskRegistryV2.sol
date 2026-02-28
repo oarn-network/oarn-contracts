@@ -87,7 +87,7 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
     uint256 public taskCount;
     uint256 public activeTaskCount;
 
-    address public tokenReward;
+    address public immutable tokenReward;
     uint256 public minRewardPerNode = 0.001 ether;
 
     // Consensus thresholds (in basis points, 10000 = 100%)
@@ -95,7 +95,7 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
     uint256 public superMajorityThreshold = 6667; // >66.67%
 
     // Dispute resolution
-    uint256 public disputeWindow = 1 hours;
+    uint256 public constant DISPUTE_WINDOW = 1 hours;
     mapping(uint256 => uint256) public disputeDeadline;
 
     // ============ Events ============
@@ -142,6 +142,7 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
     // ============ Constructor ============
 
     constructor(address _tokenReward) Ownable(msg.sender) {
+        require(_tokenReward != address(0), "Invalid token reward address");
         tokenReward = _tokenReward;
     }
 
@@ -341,7 +342,7 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
         } else {
             // No clear consensus - enter dispute
             task.status = TaskStatus.Disputed;
-            disputeDeadline[taskId] = block.timestamp + disputeWindow;
+            disputeDeadline[taskId] = block.timestamp + DISPUTE_WINDOW;
 
             emit ConsensusDisputed(taskId, hashes.length, winningCount);
         }
@@ -359,35 +360,50 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
 
     /**
      * @notice Distribute rewards to nodes that matched consensus
+     * @dev Uses checks-effects-interactions pattern to prevent reentrancy
      */
     function _distributeRewards(uint256 taskId) internal {
         Task storage task = tasks[taskId];
         NodeResult[] storage results = taskResults[taskId];
 
-        uint256 totalDistributed = 0;
-        uint256 rewardedCount = 0;
-
-        for (uint256 i = 0; i < results.length && rewardedCount < task.requiredNodes; i++) {
-            if (results[i].matchesConsensus && !results[i].rewarded) {
-                results[i].rewarded = true;
-                rewardedCount++;
-
-                (bool success, ) = results[i].node.call{value: task.rewardPerNode}("");
-                if (success) {
-                    totalDistributed += task.rewardPerNode;
-                    emit RewardDistributed(taskId, results[i].node, task.rewardPerNode, true);
-                }
-            }
-        }
-
+        // EFFECTS: Update state BEFORE external calls (reentrancy protection)
         task.status = TaskStatus.Completed;
         activeTaskCount--;
 
+        // Calculate rewards to distribute
+        uint256 totalDistributed = 0;
+        uint256 rewardedCount = 0;
+        uint256 rewardPerNode = task.rewardPerNode;
+        uint256 requiredNodes = task.requiredNodes;
+        address requester = task.requester;
+
+        // Mark nodes as rewarded BEFORE transfers
+        address[] memory nodesToReward = new address[](requiredNodes);
+        uint256 nodeCount = 0;
+
+        for (uint256 i = 0; i < results.length && rewardedCount < requiredNodes; i++) {
+            if (results[i].matchesConsensus && !results[i].rewarded) {
+                results[i].rewarded = true;
+                nodesToReward[nodeCount] = results[i].node;
+                nodeCount++;
+                rewardedCount++;
+            }
+        }
+
+        // INTERACTIONS: External calls AFTER all state changes
+        for (uint256 i = 0; i < nodeCount; i++) {
+            (bool success, ) = nodesToReward[i].call{value: rewardPerNode}("");
+            if (success) {
+                totalDistributed += rewardPerNode;
+                emit RewardDistributed(taskId, nodesToReward[i], rewardPerNode, true);
+            }
+        }
+
         // Refund unused rewards to requester
-        uint256 totalBudget = task.rewardPerNode * task.requiredNodes;
+        uint256 totalBudget = rewardPerNode * requiredNodes;
         if (totalDistributed < totalBudget) {
             uint256 refund = totalBudget - totalDistributed;
-            (bool success, ) = task.requester.call{value: refund}("");
+            (bool success, ) = requester.call{value: refund}("");
             // Don't revert if refund fails, just continue
         }
 
