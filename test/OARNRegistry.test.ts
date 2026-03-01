@@ -2,17 +2,9 @@ import { expect } from "chai";
 import { ethers } from "hardhat";
 import { OARNRegistry } from "../typechain-types";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
-import { time } from "@nomicfoundation/hardhat-network-helpers";
+import { time, loadFixture } from "@nomicfoundation/hardhat-network-helpers";
 
 describe("OARNRegistry", function () {
-  let registry: OARNRegistry;
-  let owner: SignerWithAddress;
-  let provider1: SignerWithAddress;
-  let provider2: SignerWithAddress;
-  let provider3: SignerWithAddress;
-  let node1: SignerWithAddress;
-  let node2: SignerWithAddress;
-
   // Mock addresses for core contracts
   const mockTaskRegistry = "0x1000000000000000000000000000000000000001";
   const mockTokenReward = "0x2000000000000000000000000000000000000002";
@@ -24,21 +16,72 @@ describe("OARNRegistry", function () {
   const BOOTSTRAP_MIN_STAKE = ethers.parseEther("1000");
   const UNSTAKE_COOLDOWN = 7 * 24 * 60 * 60; // 7 days in seconds
 
-  beforeEach(async function () {
-    [owner, provider1, provider2, provider3, node1, node2] = await ethers.getSigners();
+  async function deployFixture() {
+    const [owner, provider1, provider2, provider3, node1, node2] = await ethers.getSigners();
 
     const OARNRegistry = await ethers.getContractFactory("OARNRegistry");
-    registry = await OARNRegistry.deploy(
+    const registry = await OARNRegistry.deploy(
       mockTaskRegistry,
       mockTokenReward,
       mockValidatorRegistry,
       mockGovernance,
       mockGovToken
     );
-  });
+
+    return { registry, owner, provider1, provider2, provider3, node1, node2 };
+  }
+
+  async function deployWithRPCProviderFixture() {
+    const { registry, owner, provider1, provider2, provider3, node1, node2 } = await deployFixture();
+
+    await registry.connect(provider1).registerRPCProvider(
+      "https://rpc.example.com",
+      "",
+      { value: RPC_MIN_STAKE }
+    );
+
+    return { registry, owner, provider1, provider2, provider3, node1, node2 };
+  }
+
+  async function deployWithMultipleProvidersFixture() {
+    const { registry, owner, provider1, provider2, provider3, node1, node2 } = await deployFixture();
+
+    await registry.connect(provider1).registerRPCProvider(
+      "https://rpc1.example.com",
+      "",
+      { value: RPC_MIN_STAKE }
+    );
+    await registry.connect(provider2).registerRPCProvider(
+      "https://rpc2.example.com",
+      "",
+      { value: RPC_MIN_STAKE }
+    );
+
+    return { registry, owner, provider1, provider2, provider3, node1, node2 };
+  }
+
+  async function deployWithRPCAndBootstrapFixture() {
+    const { registry, owner, provider1, provider2, provider3, node1, node2 } = await deployFixture();
+
+    await registry.connect(provider1).registerRPCProvider(
+      "https://rpc.example.com",
+      "",
+      { value: RPC_MIN_STAKE }
+    );
+    await registry.connect(node1).registerBootstrapNode(
+      "QmPeerId",
+      "/ip4/1.2.3.4/tcp/4001",
+      "",
+      "",
+      { value: BOOTSTRAP_MIN_STAKE }
+    );
+
+    return { registry, owner, provider1, provider2, provider3, node1, node2 };
+  }
 
   describe("Constructor", function () {
     it("should set immutable core addresses correctly", async function () {
+      const { registry } = await loadFixture(deployFixture);
       expect(await registry.taskRegistry()).to.equal(mockTaskRegistry);
       expect(await registry.tokenReward()).to.equal(mockTokenReward);
       expect(await registry.validatorRegistry()).to.equal(mockValidatorRegistry);
@@ -47,6 +90,7 @@ describe("OARNRegistry", function () {
     });
 
     it("should set owner correctly", async function () {
+      const { registry, owner } = await loadFixture(deployFixture);
       expect(await registry.owner()).to.equal(owner.address);
     });
 
@@ -118,6 +162,8 @@ describe("OARNRegistry", function () {
 
   describe("RPC Provider Registration", function () {
     it("should register RPC provider with sufficient stake", async function () {
+      const { registry, provider1 } = await loadFixture(deployFixture);
+
       await expect(
         registry.connect(provider1).registerRPCProvider(
           "https://rpc.example.com",
@@ -132,6 +178,8 @@ describe("OARNRegistry", function () {
     });
 
     it("should revert with insufficient stake", async function () {
+      const { registry, provider1 } = await loadFixture(deployFixture);
+
       await expect(
         registry.connect(provider1).registerRPCProvider(
           "https://rpc.example.com",
@@ -142,6 +190,8 @@ describe("OARNRegistry", function () {
     });
 
     it("should revert with empty endpoint", async function () {
+      const { registry, provider1 } = await loadFixture(deployFixture);
+
       await expect(
         registry.connect(provider1).registerRPCProvider(
           "",
@@ -152,11 +202,7 @@ describe("OARNRegistry", function () {
     });
 
     it("should revert if already registered", async function () {
-      await registry.connect(provider1).registerRPCProvider(
-        "https://rpc1.example.com",
-        "",
-        { value: RPC_MIN_STAKE }
-      );
+      const { registry, provider1 } = await loadFixture(deployWithRPCProviderFixture);
 
       await expect(
         registry.connect(provider1).registerRPCProvider(
@@ -168,6 +214,8 @@ describe("OARNRegistry", function () {
     });
 
     it("should store provider data correctly", async function () {
+      const { registry, provider1 } = await loadFixture(deployFixture);
+
       await registry.connect(provider1).registerRPCProvider(
         "https://rpc.example.com",
         "http://test.onion",
@@ -185,15 +233,9 @@ describe("OARNRegistry", function () {
   });
 
   describe("RPC Provider Updates", function () {
-    beforeEach(async function () {
-      await registry.connect(provider1).registerRPCProvider(
-        "https://old.example.com",
-        "http://old.onion",
-        { value: RPC_MIN_STAKE }
-      );
-    });
-
     it("should update provider endpoints", async function () {
+      const { registry, provider1 } = await loadFixture(deployWithRPCProviderFixture);
+
       await expect(
         registry.connect(provider1).updateRPCProvider(
           "https://new.example.com",
@@ -207,6 +249,8 @@ describe("OARNRegistry", function () {
     });
 
     it("should revert if not registered", async function () {
+      const { registry, provider2 } = await loadFixture(deployWithRPCProviderFixture);
+
       await expect(
         registry.connect(provider2).updateRPCProvider(
           "https://new.example.com",
@@ -218,6 +262,8 @@ describe("OARNRegistry", function () {
 
   describe("Bootstrap Node Registration", function () {
     it("should register bootstrap node with sufficient stake", async function () {
+      const { registry, node1 } = await loadFixture(deployFixture);
+
       await expect(
         registry.connect(node1).registerBootstrapNode(
           "QmPeerId12345",
@@ -233,6 +279,8 @@ describe("OARNRegistry", function () {
     });
 
     it("should revert with insufficient stake", async function () {
+      const { registry, node1 } = await loadFixture(deployFixture);
+
       await expect(
         registry.connect(node1).registerBootstrapNode(
           "QmPeerId",
@@ -245,6 +293,8 @@ describe("OARNRegistry", function () {
     });
 
     it("should revert with empty peer ID", async function () {
+      const { registry, node1 } = await loadFixture(deployFixture);
+
       await expect(
         registry.connect(node1).registerBootstrapNode(
           "",
@@ -257,6 +307,8 @@ describe("OARNRegistry", function () {
     });
 
     it("should store node data correctly", async function () {
+      const { registry, node1 } = await loadFixture(deployFixture);
+
       await registry.connect(node1).registerBootstrapNode(
         "QmPeerId12345",
         "/ip4/1.2.3.4/tcp/4001",
@@ -277,15 +329,9 @@ describe("OARNRegistry", function () {
   });
 
   describe("Heartbeat", function () {
-    beforeEach(async function () {
-      await registry.connect(provider1).registerRPCProvider(
-        "https://rpc.example.com",
-        "",
-        { value: RPC_MIN_STAKE }
-      );
-    });
-
     it("should update heartbeat timestamp", async function () {
+      const { registry, provider1 } = await loadFixture(deployWithRPCProviderFixture);
+
       const beforeHeartbeat = await registry.rpcProviders(1);
 
       await time.increase(3600); // Advance 1 hour
@@ -299,20 +345,9 @@ describe("OARNRegistry", function () {
   });
 
   describe("Get Active Providers", function () {
-    beforeEach(async function () {
-      await registry.connect(provider1).registerRPCProvider(
-        "https://rpc1.example.com",
-        "",
-        { value: RPC_MIN_STAKE }
-      );
-      await registry.connect(provider2).registerRPCProvider(
-        "https://rpc2.example.com",
-        "",
-        { value: RPC_MIN_STAKE }
-      );
-    });
-
     it("should return all active RPC providers", async function () {
+      const { registry } = await loadFixture(deployWithMultipleProvidersFixture);
+
       const providers = await registry.getActiveRPCProviders();
       expect(providers.length).to.equal(2);
       expect(providers[0].endpoint).to.equal("https://rpc1.example.com");
@@ -320,6 +355,8 @@ describe("OARNRegistry", function () {
     });
 
     it("should return random RPC providers", async function () {
+      const { registry, provider3 } = await loadFixture(deployWithMultipleProvidersFixture);
+
       await registry.connect(provider3).registerRPCProvider(
         "https://rpc3.example.com",
         "",
@@ -331,6 +368,8 @@ describe("OARNRegistry", function () {
     });
 
     it("should revert if requesting more providers than available", async function () {
+      const { registry } = await loadFixture(deployWithMultipleProvidersFixture);
+
       await expect(
         registry.getRandomRPCProviders(5)
       ).to.be.revertedWith("Not enough providers");
@@ -338,15 +377,9 @@ describe("OARNRegistry", function () {
   });
 
   describe("Unstaking", function () {
-    beforeEach(async function () {
-      await registry.connect(provider1).registerRPCProvider(
-        "https://rpc.example.com",
-        "",
-        { value: RPC_MIN_STAKE }
-      );
-    });
-
     it("should initiate unstake correctly", async function () {
+      const { registry, provider1 } = await loadFixture(deployWithRPCProviderFixture);
+
       await expect(registry.connect(provider1).initiateUnstake())
         .to.emit(registry, "UnstakeInitiated")
         .to.emit(registry, "RPCProviderDeactivated");
@@ -356,12 +389,16 @@ describe("OARNRegistry", function () {
     });
 
     it("should revert if no active stake", async function () {
+      const { registry, provider2 } = await loadFixture(deployWithRPCProviderFixture);
+
       await expect(
         registry.connect(provider2).initiateUnstake()
       ).to.be.revertedWith("No active stake");
     });
 
     it("should complete unstake after cooldown", async function () {
+      const { registry, provider1 } = await loadFixture(deployWithRPCProviderFixture);
+
       await registry.connect(provider1).initiateUnstake();
 
       await time.increase(UNSTAKE_COOLDOWN + 1);
@@ -376,6 +413,8 @@ describe("OARNRegistry", function () {
     });
 
     it("should revert if cooldown not complete", async function () {
+      const { registry, provider1 } = await loadFixture(deployWithRPCProviderFixture);
+
       await registry.connect(provider1).initiateUnstake();
 
       await time.increase(UNSTAKE_COOLDOWN - 100);
@@ -386,6 +425,8 @@ describe("OARNRegistry", function () {
     });
 
     it("should revert if no pending unstake", async function () {
+      const { registry, provider1 } = await loadFixture(deployWithRPCProviderFixture);
+
       await expect(
         registry.connect(provider1).completeUnstake()
       ).to.be.revertedWith("No pending unstake");
@@ -393,22 +434,9 @@ describe("OARNRegistry", function () {
   });
 
   describe("Slashing", function () {
-    beforeEach(async function () {
-      await registry.connect(provider1).registerRPCProvider(
-        "https://rpc.example.com",
-        "",
-        { value: RPC_MIN_STAKE }
-      );
-      await registry.connect(node1).registerBootstrapNode(
-        "QmPeerId",
-        "/ip4/1.2.3.4/tcp/4001",
-        "",
-        "",
-        { value: BOOTSTRAP_MIN_STAKE }
-      );
-    });
-
     it("should slash RPC provider", async function () {
+      const { registry } = await loadFixture(deployWithRPCAndBootstrapFixture);
+
       const slashAmount = ethers.parseEther("500");
 
       await expect(
@@ -421,6 +449,8 @@ describe("OARNRegistry", function () {
     });
 
     it("should deactivate RPC provider if stake falls below minimum", async function () {
+      const { registry } = await loadFixture(deployWithRPCAndBootstrapFixture);
+
       const slashAmount = ethers.parseEther("4500"); // Leaves 500, below 5000 minimum
 
       await registry.slashRPCProvider(1, slashAmount, "Severe violation");
@@ -431,6 +461,8 @@ describe("OARNRegistry", function () {
     });
 
     it("should slash bootstrap node", async function () {
+      const { registry } = await loadFixture(deployWithRPCAndBootstrapFixture);
+
       const slashAmount = ethers.parseEther("100");
 
       await expect(
@@ -442,12 +474,16 @@ describe("OARNRegistry", function () {
     });
 
     it("should revert if non-owner tries to slash", async function () {
+      const { registry, provider2 } = await loadFixture(deployWithRPCAndBootstrapFixture);
+
       await expect(
         registry.connect(provider2).slashRPCProvider(1, ethers.parseEther("100"), "Test")
       ).to.be.revertedWithCustomError(registry, "OwnableUnauthorizedAccount");
     });
 
     it("should revert if slashing more than stake", async function () {
+      const { registry } = await loadFixture(deployWithRPCAndBootstrapFixture);
+
       await expect(
         registry.slashRPCProvider(1, ethers.parseEther("10000"), "Test")
       ).to.be.revertedWith("Insufficient stake to slash");
@@ -455,22 +491,9 @@ describe("OARNRegistry", function () {
   });
 
   describe("View Functions", function () {
-    beforeEach(async function () {
-      await registry.connect(provider1).registerRPCProvider(
-        "https://rpc.example.com",
-        "",
-        { value: RPC_MIN_STAKE }
-      );
-      await registry.connect(node1).registerBootstrapNode(
-        "QmPeerId",
-        "/ip4/1.2.3.4/tcp/4001",
-        "",
-        "",
-        { value: BOOTSTRAP_MIN_STAKE }
-      );
-    });
-
     it("should return core contracts", async function () {
+      const { registry } = await loadFixture(deployWithRPCAndBootstrapFixture);
+
       const [task, reward, validator, gov, govToken] = await registry.getCoreContracts();
       expect(task).to.equal(mockTaskRegistry);
       expect(reward).to.equal(mockTokenReward);
@@ -480,18 +503,24 @@ describe("OARNRegistry", function () {
     });
 
     it("should check if address is active provider", async function () {
+      const { registry, provider1 } = await loadFixture(deployWithRPCAndBootstrapFixture);
+
       const [isRpc, isBootstrap] = await registry.isActiveProvider(provider1.address);
       expect(isRpc).to.be.true;
       expect(isBootstrap).to.be.false;
     });
 
     it("should check if address is active bootstrap node", async function () {
+      const { registry, node1 } = await loadFixture(deployWithRPCAndBootstrapFixture);
+
       const [isRpc, isBootstrap] = await registry.isActiveProvider(node1.address);
       expect(isRpc).to.be.false;
       expect(isBootstrap).to.be.true;
     });
 
     it("should return false for non-registered address", async function () {
+      const { registry, provider2 } = await loadFixture(deployWithRPCAndBootstrapFixture);
+
       const [isRpc, isBootstrap] = await registry.isActiveProvider(provider2.address);
       expect(isRpc).to.be.false;
       expect(isBootstrap).to.be.false;
@@ -500,14 +529,17 @@ describe("OARNRegistry", function () {
 
   describe("Constants", function () {
     it("should have correct RPC minimum stake", async function () {
+      const { registry } = await loadFixture(deployFixture);
       expect(await registry.RPC_MIN_STAKE()).to.equal(RPC_MIN_STAKE);
     });
 
     it("should have correct bootstrap minimum stake", async function () {
+      const { registry } = await loadFixture(deployFixture);
       expect(await registry.BOOTSTRAP_MIN_STAKE()).to.equal(BOOTSTRAP_MIN_STAKE);
     });
 
     it("should have correct unstake cooldown", async function () {
+      const { registry } = await loadFixture(deployFixture);
       expect(await registry.UNSTAKE_COOLDOWN()).to.equal(UNSTAKE_COOLDOWN);
     });
   });

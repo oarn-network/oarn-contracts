@@ -53,6 +53,11 @@ contract OARNRegistry is Ownable, ReentrancyGuard {
     address public immutable governance;
     address public immutable govToken;
 
+    // ============ Upgradeable Contract Addresses ============
+    // Can be updated by owner for contract upgrades
+
+    address public taskRegistryV2;  // Multi-node consensus version
+
     // ============ State Variables ============
 
     // RPC Providers
@@ -92,6 +97,8 @@ contract OARNRegistry is Ownable, ReentrancyGuard {
     event UnstakeCompleted(address indexed owner, uint256 amount);
 
     event Heartbeat(address indexed provider, uint256 timestamp);
+
+    event TaskRegistryV2Updated(address indexed oldAddress, address indexed newAddress);
 
     // ============ Constructor ============
 
@@ -426,6 +433,17 @@ contract OARNRegistry is Ownable, ReentrancyGuard {
         emit BootstrapNodeSlashed(id, amount, reason);
     }
 
+    /**
+     * @notice Update TaskRegistryV2 address (for contract upgrades)
+     * @param _taskRegistryV2 New TaskRegistryV2 contract address
+     */
+    function setTaskRegistryV2(address _taskRegistryV2) external onlyOwner {
+        require(_taskRegistryV2 != address(0), "Invalid TaskRegistryV2 address");
+        address oldAddress = taskRegistryV2;
+        taskRegistryV2 = _taskRegistryV2;
+        emit TaskRegistryV2Updated(oldAddress, _taskRegistryV2);
+    }
+
     // ============ View Functions ============
 
     /**
@@ -439,6 +457,20 @@ contract OARNRegistry is Ownable, ReentrancyGuard {
         address _govToken
     ) {
         return (taskRegistry, tokenReward, validatorRegistry, governance, govToken);
+    }
+
+    /**
+     * @notice Get all core contract addresses including V2 contracts
+     */
+    function getCoreContractsV2() external view returns (
+        address _taskRegistry,
+        address _taskRegistryV2,
+        address _tokenReward,
+        address _validatorRegistry,
+        address _governance,
+        address _govToken
+    ) {
+        return (taskRegistry, taskRegistryV2, tokenReward, validatorRegistry, governance, govToken);
     }
 
     /**

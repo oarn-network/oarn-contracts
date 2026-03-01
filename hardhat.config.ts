@@ -19,6 +19,10 @@ const config: HardhatUserConfig = {
   networks: {
     hardhat: {
       chainId: 31337,
+      accounts: {
+        // Higher balance needed for RPC staking tests (5000 ETH stake)
+        accountsBalance: "100000000000000000000000", // 100,000 ETH
+      },
     },
     localhost: {
       url: "http://127.0.0.1:8545",

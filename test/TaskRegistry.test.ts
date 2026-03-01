@@ -1,6 +1,6 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
-import { loadFixture } from "@nomicfoundation/hardhat-toolbox/network-helpers";
+import { loadFixture, time } from "@nomicfoundation/hardhat-network-helpers";
 
 describe("TaskRegistry", function () {
   async function deployFixture() {
@@ -28,7 +28,7 @@ describe("TaskRegistry", function () {
       const inputHash = ethers.keccak256(ethers.toUtf8Bytes("input-data"));
       const rewardPerNode = ethers.parseEther("10");
       const requiredNodes = 3;
-      const deadline = Math.floor(Date.now() / 1000) + 3600; // 1 hour
+      const deadline = (await time.latest()) + 3600; // 1 hour from now
 
       const tx = await taskRegistry.connect(requester).submitTask(
         modelHash,
@@ -63,7 +63,7 @@ describe("TaskRegistry", function () {
           "{}",
           rewardPerNode,
           3,
-          Math.floor(Date.now() / 1000) + 3600,
+          (await time.latest()) + 3600,
           { value: ethers.parseEther("1") } // Not enough
         )
       ).to.be.revertedWith("Insufficient payment");
@@ -82,7 +82,7 @@ describe("TaskRegistry", function () {
           "{}",
           ethers.parseEther("10"),
           3,
-          Math.floor(Date.now() / 1000) - 3600, // Past deadline
+          (await time.latest()) - 3600, // Past deadline
           { value: ethers.parseEther("30") }
         )
       ).to.be.revertedWith("Invalid deadline");
@@ -104,7 +104,7 @@ describe("TaskRegistry", function () {
         "{}",
         rewardPerNode,
         3,
-        Math.floor(Date.now() / 1000) + 3600,
+        (await time.latest()) + 3600,
         { value: rewardPerNode * 3n }
       );
 
@@ -128,7 +128,7 @@ describe("TaskRegistry", function () {
         "{}",
         ethers.parseEther("10"),
         3,
-        Math.floor(Date.now() / 1000) + 3600,
+        (await time.latest()) + 3600,
         { value: ethers.parseEther("30") }
       );
 
@@ -153,7 +153,7 @@ describe("TaskRegistry", function () {
         "{}",
         ethers.parseEther("10"),
         1, // Only 1 node needed
-        Math.floor(Date.now() / 1000) + 3600,
+        (await time.latest()) + 3600,
         { value: ethers.parseEther("10") }
       );
 
@@ -176,7 +176,7 @@ describe("TaskRegistry", function () {
         "{}",
         rewardPerNode,
         3,
-        Math.floor(Date.now() / 1000) + 3600,
+        (await time.latest()) + 3600,
         { value: rewardPerNode * 3n }
       );
 
@@ -210,7 +210,7 @@ describe("TaskRegistry", function () {
         "{}",
         ethers.parseEther("10"),
         1,
-        Math.floor(Date.now() / 1000) + 3600,
+        (await time.latest()) + 3600,
         { value: ethers.parseEther("10") }
       );
 
@@ -237,7 +237,7 @@ describe("TaskRegistry", function () {
         "{}",
         rewardPerNode,
         3,
-        Math.floor(Date.now() / 1000) + 3600,
+        (await time.latest()) + 3600,
         { value: rewardPerNode * 3n }
       );
 
@@ -261,111 +261,13 @@ describe("TaskRegistry", function () {
         "{}",
         ethers.parseEther("10"),
         3,
-        Math.floor(Date.now() / 1000) + 3600,
+        (await time.latest()) + 3600,
         { value: ethers.parseEther("30") }
       );
 
       await expect(
         taskRegistry.connect(node1).cancelTask(1)
       ).to.be.revertedWith("Not task owner");
-    });
-  });
-});
-
-describe("OARNRegistry", function () {
-  async function deployRegistryFixture() {
-    const [owner, provider1, provider2] = await ethers.getSigners();
-
-    // Deploy mock contracts for registry
-    const COMPToken = await ethers.getContractFactory("COMPToken");
-    const compToken = await COMPToken.deploy();
-
-    const GOVToken = await ethers.getContractFactory("GOVToken");
-    const govToken = await GOVToken.deploy(owner.address, owner.address);
-
-    const TaskRegistry = await ethers.getContractFactory("TaskRegistry");
-    const taskRegistry = await TaskRegistry.deploy(await compToken.getAddress());
-
-    // Deploy OARNRegistry
-    const OARNRegistry = await ethers.getContractFactory("OARNRegistry");
-    const oarnRegistry = await OARNRegistry.deploy(
-      await taskRegistry.getAddress(),
-      await compToken.getAddress(),
-      owner.address, // ValidatorRegistry placeholder
-      owner.address, // Governance placeholder
-      await govToken.getAddress()
-    );
-
-    return { oarnRegistry, taskRegistry, compToken, govToken, owner, provider1, provider2 };
-  }
-
-  describe("RPC Provider Registration", function () {
-    it("Should register RPC provider with sufficient stake", async function () {
-      const { oarnRegistry, provider1 } = await loadFixture(deployRegistryFixture);
-
-      const minStake = await oarnRegistry.RPC_MIN_STAKE();
-
-      await expect(
-        oarnRegistry.connect(provider1).registerRPCProvider(
-          "https://rpc.example.com",
-          "http://example.onion",
-          { value: minStake }
-        )
-      ).to.emit(oarnRegistry, "RPCProviderRegistered");
-
-      const activeCount = await oarnRegistry.activeRpcCount();
-      expect(activeCount).to.equal(1);
-    });
-
-    it("Should reject registration with insufficient stake", async function () {
-      const { oarnRegistry, provider1 } = await loadFixture(deployRegistryFixture);
-
-      await expect(
-        oarnRegistry.connect(provider1).registerRPCProvider(
-          "https://rpc.example.com",
-          "",
-          { value: ethers.parseEther("100") } // Less than 5000
-        )
-      ).to.be.revertedWith("Insufficient stake");
-    });
-  });
-
-  describe("Bootstrap Node Registration", function () {
-    it("Should register bootstrap node", async function () {
-      const { oarnRegistry, provider1 } = await loadFixture(deployRegistryFixture);
-
-      const minStake = await oarnRegistry.BOOTSTRAP_MIN_STAKE();
-
-      await expect(
-        oarnRegistry.connect(provider1).registerBootstrapNode(
-          "12D3KooWExample...",
-          "/ip4/1.2.3.4/tcp/4001",
-          "http://example.onion",
-          "",
-          { value: minStake }
-        )
-      ).to.emit(oarnRegistry, "BootstrapNodeRegistered");
-
-      const activeCount = await oarnRegistry.activeBootstrapCount();
-      expect(activeCount).to.equal(1);
-    });
-  });
-
-  describe("Core Contract Discovery", function () {
-    it("Should return all core contract addresses", async function () {
-      const { oarnRegistry, taskRegistry, compToken, govToken, owner } = await loadFixture(deployRegistryFixture);
-
-      const [
-        taskRegistryAddr,
-        tokenRewardAddr,
-        validatorRegistryAddr,
-        governanceAddr,
-        govTokenAddr
-      ] = await oarnRegistry.getCoreContracts();
-
-      expect(taskRegistryAddr).to.equal(await taskRegistry.getAddress());
-      expect(tokenRewardAddr).to.equal(await compToken.getAddress());
-      expect(govTokenAddr).to.equal(await govToken.getAddress());
     });
   });
 });
