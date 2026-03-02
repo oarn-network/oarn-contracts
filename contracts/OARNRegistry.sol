@@ -400,6 +400,75 @@ contract OARNRegistry is Ownable, ReentrancyGuard {
     // ============ Admin Functions ============
 
     /**
+     * @notice Add an RPC provider without stake (owner only, for bootstrapping)
+     * @dev Used for adding public RPC endpoints that don't need stake
+     */
+    function addRPCProviderAdmin(
+        string calldata endpoint,
+        string calldata onionEndpoint,
+        address providerOwner
+    ) external onlyOwner {
+        require(bytes(endpoint).length > 0, "Empty endpoint");
+        require(providerOwner != address(0), "Invalid owner");
+        require(rpcProviderIds[providerOwner] == 0, "Already registered");
+
+        rpcProviderCount++;
+        uint256 id = rpcProviderCount;
+
+        rpcProviders[id] = RPCProvider({
+            endpoint: endpoint,
+            onionEndpoint: onionEndpoint,
+            owner: providerOwner,
+            stake: 0,  // No stake required for admin-added providers
+            registeredAt: block.timestamp,
+            lastHeartbeat: block.timestamp,
+            uptime: 10000,
+            reportCount: 0,
+            isActive: true
+        });
+
+        rpcProviderIds[providerOwner] = id;
+        activeRpcCount++;
+
+        emit RPCProviderRegistered(id, providerOwner, endpoint);
+    }
+
+    /**
+     * @notice Add a bootstrap node without stake (owner only, for bootstrapping)
+     */
+    function addBootstrapNodeAdmin(
+        string calldata peerId,
+        string calldata multiaddr,
+        string calldata onionAddress,
+        string calldata i2pAddress,
+        address nodeOwner
+    ) external onlyOwner {
+        require(bytes(peerId).length > 0, "Empty peer ID");
+        require(nodeOwner != address(0), "Invalid owner");
+        require(bootstrapNodeIds[nodeOwner] == 0, "Already registered");
+
+        bootstrapNodeCount++;
+        uint256 id = bootstrapNodeCount;
+
+        bootstrapNodes[id] = BootstrapNode({
+            peerId: peerId,
+            multiaddr: multiaddr,
+            onionAddress: onionAddress,
+            i2pAddress: i2pAddress,
+            owner: nodeOwner,
+            stake: 0,  // No stake required for admin-added nodes
+            registeredAt: block.timestamp,
+            lastHeartbeat: block.timestamp,
+            isActive: true
+        });
+
+        bootstrapNodeIds[nodeOwner] = id;
+        activeBootstrapCount++;
+
+        emit BootstrapNodeRegistered(id, nodeOwner, peerId);
+    }
+
+    /**
      * @notice Slash a misbehaving RPC provider (governance only)
      */
     function slashRPCProvider(uint256 id, uint256 amount, string calldata reason) external onlyOwner {
