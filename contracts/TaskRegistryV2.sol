@@ -139,6 +139,13 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
 
     event TaskCompleted(uint256 indexed taskId, uint256 totalRewards);
 
+    event TaskFunded(
+        uint256 indexed taskId,
+        address indexed funder,
+        uint256 fundingAmount,
+        uint256 newRewardPerNode
+    );
+
     // ============ Constructor ============
 
     constructor(address _tokenReward) Ownable(msg.sender) {
@@ -221,6 +228,30 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
             deadline,
             ConsensusType.Majority
         );
+    }
+
+    /**
+     * @notice Fund an existing task with additional ETH to increase rewards
+     * @param taskId The task ID to fund
+     */
+    function fundTask(uint256 taskId) external payable nonReentrant whenNotPaused {
+        Task storage task = tasks[taskId];
+
+        require(task.id != 0, "Task not found");
+        require(task.status == TaskStatus.Pending || task.status == TaskStatus.Active,
+                "Task not fundable");
+        require(msg.value > 0, "Must send ETH");
+        require(block.timestamp < task.deadline, "Task expired");
+
+        // Calculate new reward per node
+        uint256 currentPool = task.rewardPerNode * task.requiredNodes;
+        uint256 newPool = currentPool + msg.value;
+        uint256 newRewardPerNode = newPool / task.requiredNodes;
+
+        // Update task reward
+        task.rewardPerNode = newRewardPerNode;
+
+        emit TaskFunded(taskId, msg.sender, msg.value, newRewardPerNode);
     }
 
     // ============ Task Processing ============

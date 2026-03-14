@@ -996,6 +996,182 @@ describe("TaskRegistryV2", function () {
     });
   });
 
+  describe("Task Funding", function () {
+    it("should allow anyone to fund a pending task", async function () {
+      const { taskRegistry, requester, node1 } = await loadFixture(deployFixture);
+
+      const modelHash = ethers.keccak256(ethers.toUtf8Bytes("model-v1"));
+      const rewardPerNode = ethers.parseEther("0.01");
+      const requiredNodes = 3;
+
+      await taskRegistry.connect(requester)["submitTask(bytes32,bytes32,string,uint256,uint256,uint256)"](
+        modelHash,
+        modelHash,
+        "{}",
+        rewardPerNode,
+        requiredNodes,
+        (await time.latest()) + ONE_DAY,
+        { value: rewardPerNode * BigInt(requiredNodes) }
+      );
+
+      const fundAmount = ethers.parseEther("0.03"); // Add 0.03 ETH
+      const expectedNewReward = ethers.parseEther("0.02"); // (0.03 + 0.03) / 3 = 0.02
+
+      const tx = await taskRegistry.connect(node1).fundTask(1, { value: fundAmount });
+
+      await expect(tx)
+        .to.emit(taskRegistry, "TaskFunded")
+        .withArgs(1, node1.address, fundAmount, expectedNewReward);
+
+      const task = await taskRegistry.tasks(1);
+      expect(task.rewardPerNode).to.equal(expectedNewReward);
+    });
+
+    it("should allow anyone to fund an active task", async function () {
+      const { taskRegistry, requester, node1, node2 } = await loadFixture(deployFixture);
+
+      const modelHash = ethers.keccak256(ethers.toUtf8Bytes("model-v1"));
+      const rewardPerNode = ethers.parseEther("0.01");
+      const requiredNodes = 3;
+
+      await taskRegistry.connect(requester)["submitTask(bytes32,bytes32,string,uint256,uint256,uint256)"](
+        modelHash,
+        modelHash,
+        "{}",
+        rewardPerNode,
+        requiredNodes,
+        (await time.latest()) + ONE_DAY,
+        { value: rewardPerNode * BigInt(requiredNodes) }
+      );
+
+      // Claim to make it active
+      await taskRegistry.connect(node1).claimTask(1);
+
+      const task = await taskRegistry.tasks(1);
+      expect(task.status).to.equal(1); // Active
+
+      const fundAmount = ethers.parseEther("0.015"); // Add 0.015 ETH
+      const expectedNewReward = ethers.parseEther("0.015"); // (0.03 + 0.015) / 3 = 0.015
+
+      const tx = await taskRegistry.connect(node2).fundTask(1, { value: fundAmount });
+
+      await expect(tx)
+        .to.emit(taskRegistry, "TaskFunded")
+        .withArgs(1, node2.address, fundAmount, expectedNewReward);
+    });
+
+    it("should reject funding a completed task", async function () {
+      const { taskRegistry, requester, node1, node2, node3 } = await loadFixture(deployFixture);
+
+      const modelHash = ethers.keccak256(ethers.toUtf8Bytes("model-v1"));
+      const sameResult = ethers.keccak256(ethers.toUtf8Bytes("same-result"));
+      const rewardPerNode = ethers.parseEther("0.01");
+
+      await taskRegistry.connect(requester)["submitTask(bytes32,bytes32,string,uint256,uint256,uint256)"](
+        modelHash,
+        modelHash,
+        "{}",
+        rewardPerNode,
+        3,
+        (await time.latest()) + ONE_DAY,
+        { value: rewardPerNode * 3n }
+      );
+
+      // Complete the task
+      await taskRegistry.connect(node1).claimTask(1);
+      await taskRegistry.connect(node2).claimTask(1);
+      await taskRegistry.connect(node3).claimTask(1);
+      await taskRegistry.connect(node1).submitResult(1, sameResult);
+      await taskRegistry.connect(node2).submitResult(1, sameResult);
+      await taskRegistry.connect(node3).submitResult(1, sameResult);
+
+      const task = await taskRegistry.tasks(1);
+      expect(task.status).to.equal(3); // Completed
+
+      await expect(
+        taskRegistry.connect(requester).fundTask(1, { value: ethers.parseEther("0.01") })
+      ).to.be.revertedWith("Task not fundable");
+    });
+
+    it("should reject funding a non-existent task", async function () {
+      const { taskRegistry, node1 } = await loadFixture(deployFixture);
+
+      await expect(
+        taskRegistry.connect(node1).fundTask(999, { value: ethers.parseEther("0.01") })
+      ).to.be.revertedWith("Task not found");
+    });
+
+    it("should reject funding with zero ETH", async function () {
+      const { taskRegistry, requester, node1 } = await loadFixture(deployFixture);
+
+      const modelHash = ethers.keccak256(ethers.toUtf8Bytes("model-v1"));
+
+      await taskRegistry.connect(requester)["submitTask(bytes32,bytes32,string,uint256,uint256,uint256)"](
+        modelHash,
+        modelHash,
+        "{}",
+        ethers.parseEther("0.01"),
+        3,
+        (await time.latest()) + ONE_DAY,
+        { value: ethers.parseEther("0.03") }
+      );
+
+      await expect(
+        taskRegistry.connect(node1).fundTask(1, { value: 0 })
+      ).to.be.revertedWith("Must send ETH");
+    });
+
+    it("should reject funding an expired task", async function () {
+      const { taskRegistry, requester, node1 } = await loadFixture(deployFixture);
+
+      const modelHash = ethers.keccak256(ethers.toUtf8Bytes("model-v1"));
+
+      await taskRegistry.connect(requester)["submitTask(bytes32,bytes32,string,uint256,uint256,uint256)"](
+        modelHash,
+        modelHash,
+        "{}",
+        ethers.parseEther("0.01"),
+        3,
+        (await time.latest()) + ONE_HOUR,
+        { value: ethers.parseEther("0.03") }
+      );
+
+      await time.increase(ONE_HOUR + 1);
+
+      await expect(
+        taskRegistry.connect(node1).fundTask(1, { value: ethers.parseEther("0.01") })
+      ).to.be.revertedWith("Task expired");
+    });
+
+    it("should correctly calculate new reward with multiple fundings", async function () {
+      const { taskRegistry, requester, node1, node2 } = await loadFixture(deployFixture);
+
+      const modelHash = ethers.keccak256(ethers.toUtf8Bytes("model-v1"));
+      const initialReward = ethers.parseEther("0.01");
+      const requiredNodes = 3;
+
+      await taskRegistry.connect(requester)["submitTask(bytes32,bytes32,string,uint256,uint256,uint256)"](
+        modelHash,
+        modelHash,
+        "{}",
+        initialReward,
+        requiredNodes,
+        (await time.latest()) + ONE_DAY,
+        { value: initialReward * BigInt(requiredNodes) }
+      );
+
+      // First funding
+      await taskRegistry.connect(node1).fundTask(1, { value: ethers.parseEther("0.03") });
+      let task = await taskRegistry.tasks(1);
+      expect(task.rewardPerNode).to.equal(ethers.parseEther("0.02")); // (0.03 + 0.03) / 3
+
+      // Second funding
+      await taskRegistry.connect(node2).fundTask(1, { value: ethers.parseEther("0.06") });
+      task = await taskRegistry.tasks(1);
+      expect(task.rewardPerNode).to.equal(ethers.parseEther("0.04")); // (0.06 + 0.06) / 3
+    });
+  });
+
   describe("Edge Cases", function () {
     it("should handle receive function", async function () {
       const { taskRegistry, owner } = await loadFixture(deployFixture);
