@@ -85,10 +85,12 @@ After deployment, addresses are saved to `deployment-addresses.json`.
 
 | Contract | Address |
 |----------|---------|
-| OARNRegistry | `TBD` |
-| TaskRegistry | `TBD` |
-| COMPToken | `TBD` |
-| GOVToken | `TBD` |
+| OARNRegistry | `0xa122518Cb6E66A804fc37EB26c8a7aF309dCF04C` |
+| TaskRegistryV2 | `0xD15530ce13188EE88E43Ab07EDD9E8729fCc55D0` |
+| WetLabOracle | `0xF8991A56cB5B9073a3eEC87E95Dfb055fdDF0094` |
+| OARNGovernance | `0x56D2826FF4FaEF8d4Db54eF11e86d0421fc2893B` |
+| COMPToken | `0x24249A523A251E38CB0001daBd54DD44Ea8f1838` |
+| GOVToken | `0xB97eDD49C225d2c43e7203aB9248cAbED2B268d3` |
 
 ## Key Features
 
