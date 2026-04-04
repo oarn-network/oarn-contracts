@@ -41,6 +41,14 @@ contract WetLabOracle is Ownable, ReentrancyGuard {
         bool      reached;
     }
 
+    // ============ Constants ============
+
+    /// Maximum certified labs that may submit per task; caps the O(n²) _checkConsensus loop.
+    uint256 public constant MAX_SUBMITTERS_PER_TASK = 50;
+
+    /// Maximum byte-length for the metric string stored on-chain.
+    uint256 public constant MAX_METRIC_LENGTH = 64;
+
     // ============ State Variables ============
 
     address public immutable govToken;
@@ -54,6 +62,10 @@ contract WetLabOracle is Ownable, ReentrancyGuard {
     mapping(uint256 => ExperimentConsensus)           public consensus;
     mapping(address => uint256)                       public pendingRewards;    // lab → claimable GOV
 
+    /// Running sum of all GOV credited to labs but not yet claimed.
+    /// Used by withdrawRewardPool to ensure promised rewards cannot be pulled out.
+    uint256 public totalPendingRewards;
+
     // ============ Events ============
 
     event LabCertified(address indexed lab);
@@ -62,8 +74,11 @@ contract WetLabOracle is Ownable, ReentrancyGuard {
     event ConsensusReached(uint256 indexed taskId, bytes32 resultHash, uint256 labCount);
     event RewardClaimed(address indexed lab, uint256 amount);
     event RewardPoolDeposited(uint256 amount);
+    event RewardPoolWithdrawn(uint256 amount);
     event RewardPerVerificationUpdated(uint256 newReward);
     event RequiredConfirmationsUpdated(uint256 newRequired);
+    /// Emitted when consensus is reached but the pool is insufficient to cover rewards.
+    event RewardPoolInsufficient(uint256 indexed taskId, uint256 required, uint256 available);
 
     // ============ Constructor ============
 
@@ -118,10 +133,14 @@ contract WetLabOracle is Ownable, ReentrancyGuard {
         int256  measuredValue,
         string calldata metric
     ) external nonReentrant {
+        require(taskId > 0, "Invalid taskId");
         require(certifiedLabs[msg.sender], "Not a certified lab");
         require(labResults[taskId][msg.sender].submittedAt == 0, "Already submitted for this task");
         require(parametersHash != bytes32(0), "Invalid parameters hash");
         require(bytes(metric).length > 0, "Metric cannot be empty");
+        require(bytes(metric).length <= MAX_METRIC_LENGTH, "Metric string too long");
+        // M-2: cap submitters per task to bound _checkConsensus gas
+        require(taskLabSubmitters[taskId].length < MAX_SUBMITTERS_PER_TASK, "Max submitters reached for task");
 
         bytes32 resultHash = keccak256(abi.encode(parametersHash, measuredValue, metric));
 
@@ -152,6 +171,7 @@ contract WetLabOracle is Ownable, ReentrancyGuard {
 
         // Checks-Effects-Interactions: update state before transfer
         pendingRewards[msg.sender] = 0;
+        totalPendingRewards -= amount;
 
         require(
             IERC20(govToken).transfer(msg.sender, amount),
@@ -172,6 +192,31 @@ contract WetLabOracle is Ownable, ReentrancyGuard {
             "GOV transfer failed"
         );
         emit RewardPoolDeposited(amount);
+    }
+
+    /**
+     * @notice Withdraw GOV tokens from the reward pool back to the owner.
+     * @dev M-1: allows the owner to recover tokens if the contract is deprecated or
+     *      the pool was over-funded. Does NOT touch pending (already-credited) rewards.
+     * @param amount Amount of GOV tokens to withdraw (must not exceed unallocated balance).
+     */
+    function withdrawRewardPool(uint256 amount) external onlyOwner nonReentrant {
+        require(amount > 0, "Amount must be positive");
+
+        // Only the unallocated portion of the pool may be withdrawn.
+        // totalPendingRewards tracks tokens already credited to labs but not yet claimed;
+        // withdrawing those would cause claimReward() to revert for affected labs.
+        uint256 poolBalance = IERC20(govToken).balanceOf(address(this));
+        uint256 unallocated = poolBalance > totalPendingRewards
+            ? poolBalance - totalPendingRewards
+            : 0;
+        require(amount <= unallocated, "Amount exceeds unallocated pool balance");
+
+        require(
+            IERC20(govToken).transfer(msg.sender, amount),
+            "GOV transfer failed"
+        );
+        emit RewardPoolWithdrawn(amount);
     }
 
     // ============ Internal ============
@@ -219,13 +264,22 @@ contract WetLabOracle is Ownable, ReentrancyGuard {
 
                 emit ConsensusReached(taskId, candidateHash, count);
 
-                // Credit rewards (Checks-Effects before any external calls)
+                // H-1: verify the pool can cover all rewards before crediting anyone.
+                // If it cannot, emit a warning event and skip reward distribution rather
+                // than promising tokens that can never be delivered.
                 if (rewardPerVerification > 0) {
-                    for (uint256 k = 0; k < count; k++) {
-                        address lab = confirmingLabs[k];
-                        if (!labResults[taskId][lab].rewarded) {
-                            labResults[taskId][lab].rewarded = true;
-                            pendingRewards[lab] += rewardPerVerification;
+                    uint256 totalReward = rewardPerVerification * count;
+                    uint256 poolBalance = IERC20(govToken).balanceOf(address(this));
+                    if (totalReward > poolBalance) {
+                        emit RewardPoolInsufficient(taskId, totalReward, poolBalance);
+                    } else {
+                        for (uint256 k = 0; k < count; k++) {
+                            address lab = confirmingLabs[k];
+                            if (!labResults[taskId][lab].rewarded) {
+                                labResults[taskId][lab].rewarded = true;
+                                pendingRewards[lab] += rewardPerVerification;
+                                totalPendingRewards += rewardPerVerification;
+                            }
                         }
                     }
                 }
