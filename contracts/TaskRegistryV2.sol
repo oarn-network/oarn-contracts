@@ -5,6 +5,17 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 
+// ============ Interface ============
+
+interface INodeReputation {
+    /// @notice Returns a node's score (0–100) and tier ("New"/"Bronze"/…/"Platinum").
+    function getScore(address node) external view returns (uint256 score, string memory tier);
+    /// @notice Record a task result for a node (called after consensus).
+    function recordResult(address node, bool matchedConsensus, uint256 earnedWei) external;
+    /// @notice Increment a node's tasksClaimed counter (called on claimTask).
+    function recordClaim(address node) external;
+}
+
 /**
  * @title TaskRegistryV2
  * @notice Task registry with multi-node consensus verification
@@ -108,6 +119,11 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
     address public immutable tokenReward;
     uint256 public minRewardPerNode = 0.001 ether;
 
+    // #140/#141 — On-chain reputation and COMP multiplier pool
+    address public reputationRegistry;
+    /// ETH pool funded by the owner; used to pay the 1.2× multiplier bonus to high-rep nodes.
+    uint256 public multiplierPool;
+
     // Consensus thresholds (in basis points, 10000 = 100%)
     uint256 public majorityThreshold = 5001;      // >50%
     uint256 public superMajorityThreshold = 6667; // >66.67%
@@ -156,6 +172,9 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
     );
 
     event TaskCompleted(uint256 indexed taskId, uint256 totalRewards);
+
+    /// #141 — Emitted when a high-reputation node receives a multiplier bonus.
+    event MultiplierBonusPaid(uint256 indexed taskId, address indexed node, uint256 bonus);
 
     event TaskFunded(
         uint256 indexed taskId,
@@ -300,6 +319,11 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
         }
 
         emit TaskClaimed(taskId, msg.sender);
+
+        // #140: record the claim in the reputation registry (non-critical — ignore failures)
+        if (reputationRegistry != address(0)) {
+            try INodeReputation(reputationRegistry).recordClaim(msg.sender) {} catch {}
+        }
     }
 
     /**
@@ -414,8 +438,11 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @notice Distribute rewards to nodes that matched consensus
-     * @dev Uses checks-effects-interactions pattern to prevent reentrancy
+     * @notice Distribute rewards to nodes that matched consensus.
+     * @dev Uses checks-effects-interactions pattern to prevent reentrancy.
+     *      #140: Records each result in the reputation registry (if set).
+     *      #141: Applies a 1.2× ETH bonus to nodes with ≥95 reputation score,
+     *            funded from multiplierPool (set by fundMultiplierPool()).
      */
     function _distributeRewards(uint256 taskId) internal {
         Task storage task = tasks[taskId];
@@ -425,9 +452,6 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
         task.status = TaskStatus.Completed;
         activeTaskCount--;
 
-        // Calculate rewards to distribute
-        uint256 totalDistributed = 0;
-        uint256 rewardedCount = 0;
         uint256 rewardPerNode = task.rewardPerNode;
         uint256 requiredNodes = task.requiredNodes;
         address requester = task.requester;
@@ -435,6 +459,7 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
         // Mark nodes as rewarded BEFORE transfers
         address[] memory nodesToReward = new address[](requiredNodes);
         uint256 nodeCount = 0;
+        uint256 rewardedCount = 0;
 
         for (uint256 i = 0; i < results.length && rewardedCount < requiredNodes; i++) {
             if (results[i].matchesConsensus && !results[i].rewarded) {
@@ -445,24 +470,69 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
             }
         }
 
-        // INTERACTIONS: External calls AFTER all state changes
-        for (uint256 i = 0; i < nodeCount; i++) {
-            (bool success, ) = nodesToReward[i].call{value: rewardPerNode}("");
-            if (success) {
-                totalDistributed += rewardPerNode;
-                emit RewardDistributed(taskId, nodesToReward[i], rewardPerNode, true);
+        // #141 EFFECTS: Pre-calculate and reserve multiplier bonuses before external calls.
+        // getScore() is a view call on a trusted contract — using try/catch for safety.
+        uint256[] memory bonuses = new uint256[](nodeCount);
+        if (reputationRegistry != address(0)) {
+            for (uint256 i = 0; i < nodeCount; i++) {
+                try INodeReputation(reputationRegistry).getScore(nodesToReward[i])
+                    returns (uint256 score, string memory)
+                {
+                    if (score >= 95 && multiplierPool > 0) {
+                        uint256 b = rewardPerNode * 2 / 10; // 20% bonus = 1.2× total
+                        if (b > multiplierPool) b = multiplierPool;
+                        bonuses[i] = b;
+                        multiplierPool -= b; // deduct in effects phase
+                    }
+                } catch {}
             }
         }
 
-        // Refund unused rewards to requester
-        uint256 totalBudget = rewardPerNode * requiredNodes;
-        if (totalDistributed < totalBudget) {
-            uint256 refund = totalBudget - totalDistributed;
-            (bool success, ) = requester.call{value: refund}("");
-            // Don't revert if refund fails, just continue
+        // INTERACTIONS: External calls AFTER all state changes
+        uint256 baseDistributed = 0;
+        for (uint256 i = 0; i < nodeCount; i++) {
+            address node = nodesToReward[i];
+            uint256 payout = rewardPerNode + bonuses[i];
+            (bool success, ) = node.call{value: payout}("");
+            if (success) {
+                baseDistributed += rewardPerNode;
+                emit RewardDistributed(taskId, node, payout, true);
+                if (bonuses[i] > 0) {
+                    emit MultiplierBonusPaid(taskId, node, bonuses[i]);
+                }
+            } else if (bonuses[i] > 0) {
+                // Return unspent bonus to pool if the send failed
+                multiplierPool += bonuses[i];
+            }
+
+            // #140: record matching result in reputation registry (non-critical)
+            if (reputationRegistry != address(0)) {
+                try INodeReputation(reputationRegistry).recordResult(
+                    node, true, success ? payout : 0
+                ) {} catch {}
+            }
         }
 
-        emit TaskCompleted(taskId, totalDistributed);
+        // #140: record non-matching submissions so submissionRate stays accurate
+        if (reputationRegistry != address(0)) {
+            for (uint256 i = 0; i < results.length; i++) {
+                if (!results[i].matchesConsensus) {
+                    try INodeReputation(reputationRegistry).recordResult(
+                        results[i].node, false, 0
+                    ) {} catch {}
+                }
+            }
+        }
+
+        // Refund unused base budget to requester
+        uint256 totalBudget = rewardPerNode * requiredNodes;
+        if (baseDistributed < totalBudget) {
+            uint256 refund = totalBudget - baseDistributed;
+            (bool success, ) = requester.call{value: refund}("");
+            // Non-critical: don't revert if refund fails
+        }
+
+        emit TaskCompleted(taskId, baseDistributed);
     }
 
     // ============ Dispute Resolution ============
@@ -739,6 +809,43 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
 
     function unpause() external onlyOwner {
         _unpause();
+    }
+
+    // ============ Reputation & Multiplier Admin (#140 / #141) ============
+
+    /**
+     * @notice Set the NodeReputation contract address.
+     * @dev After setting, call NodeReputation.setTrustedUpdater(address(this), true).
+     */
+    function setReputationRegistry(address registry) external onlyOwner {
+        reputationRegistry = registry;
+    }
+
+    /**
+     * @notice Deposit ETH into the multiplier bonus pool.
+     * @dev Funds the 1.2× bonus paid to nodes with ≥95 reputation score (#141).
+     */
+    function fundMultiplierPool() external payable onlyOwner {
+        require(msg.value > 0, "Must send ETH");
+        multiplierPool += msg.value;
+    }
+
+    // ============ View Helpers (used by WetLabOracle #147) ============
+
+    /**
+     * @notice Returns true if a task was ever created.
+     */
+    function taskExists(uint256 taskId) external view returns (bool) {
+        return tasks[taskId].createdAt != 0;
+    }
+
+    /**
+     * @notice Returns the raw uint8 value of a task's current status.
+     *         Pending=0, Active=1, Consensus=2, Completed=3,
+     *         Disputed=4, Cancelled=5, Expired=6.
+     */
+    function getTaskStatus(uint256 taskId) external view returns (uint8) {
+        return uint8(tasks[taskId].status);
     }
 
     receive() external payable {}
