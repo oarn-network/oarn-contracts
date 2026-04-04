@@ -37,6 +37,11 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
         Unanimous     // 100% must agree
     }
 
+    enum TaskMode {
+        OneShot,
+        Continuous
+    }
+
     // ============ Structs ============
 
     struct Task {
@@ -72,6 +77,15 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
         uint256 calculatedAt;
     }
 
+    struct ContinuousInfo {
+        uint256 maxRounds;
+        uint256 roundsTriggered;  // rounds started (1 on creation, increments on each triggerNextRound)
+        uint256 maxSpendWei;      // total ETH cap across all rounds
+        uint256 totalSpent;       // ETH committed so far
+        bool active;
+        uint256[] roundTaskIds;   // task IDs for each round in order
+    }
+
     // ============ State Variables ============
 
     mapping(uint256 => Task) public tasks;
@@ -83,6 +97,10 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
     // Track unique result hashes per task
     mapping(uint256 => mapping(bytes32 => uint256)) public resultHashCounts;
     mapping(uint256 => bytes32[]) public uniqueResultHashes;
+
+    mapping(uint256 => TaskMode) public taskMode;
+    mapping(uint256 => ContinuousInfo) private _continuousInfo;
+    mapping(uint256 => uint256) public continuousParent; // child taskId => parent taskId
 
     uint256 public taskCount;
     uint256 public activeTaskCount;
@@ -144,6 +162,12 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
         address indexed funder,
         uint256 fundingAmount,
         uint256 newRewardPerNode
+    );
+
+    event ContinuousTaskTriggered(
+        uint256 indexed parentTaskId,
+        uint256 indexed newTaskId,
+        uint256 round
     );
 
     // ============ Constructor ============
@@ -518,6 +542,179 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
             }
         }
         return false;
+    }
+
+    // ============ Continuous Task Mode ============
+
+    /**
+     * @notice Submit a recurring task that can be re-triggered each round.
+     * @param maxRounds  Maximum number of rounds allowed (2–100).
+     * @param maxSpendWei Hard cap on total ETH spent across all rounds.
+     * @dev   Only the first round's ETH is taken here; each subsequent round is
+     *        funded individually via triggerNextRound().
+     */
+    function submitTaskContinuous(
+        bytes32 modelHash,
+        bytes32 inputHash,
+        string calldata modelRequirements,
+        uint256 rewardPerNode,
+        uint256 requiredNodes,
+        uint256 deadline,
+        ConsensusType consensusType,
+        uint256 maxRounds,
+        uint256 maxSpendWei
+    ) external payable nonReentrant whenNotPaused returns (uint256) {
+        require(maxRounds >= 2 && maxRounds <= 100, "maxRounds: 2-100");
+        require(modelHash != bytes32(0), "Invalid model hash");
+        require(requiredNodes >= 3, "Need at least 3 nodes for consensus");
+        require(requiredNodes <= 100, "Too many nodes");
+        require(deadline > block.timestamp, "Invalid deadline");
+        require(rewardPerNode >= minRewardPerNode, "Reward too low");
+
+        uint256 roundCost = rewardPerNode * requiredNodes;
+        require(maxSpendWei >= roundCost, "maxSpendWei < single round cost");
+        require(msg.value >= roundCost, "Insufficient payment");
+
+        taskCount++;
+        uint256 taskId = taskCount;
+
+        tasks[taskId] = Task({
+            id: taskId,
+            requester: msg.sender,
+            modelHash: modelHash,
+            inputHash: inputHash,
+            modelRequirements: modelRequirements,
+            rewardPerNode: rewardPerNode,
+            requiredNodes: requiredNodes,
+            claimedCount: 0,
+            submittedCount: 0,
+            deadline: deadline,
+            status: TaskStatus.Pending,
+            consensusType: consensusType,
+            createdAt: block.timestamp,
+            consensusResult: bytes32(0)
+        });
+
+        activeTaskCount++;
+
+        if (msg.value > roundCost) {
+            (bool success, ) = msg.sender.call{value: msg.value - roundCost}("");
+            require(success, "Refund failed");
+        }
+
+        emit TaskCreated(taskId, msg.sender, modelHash, rewardPerNode, requiredNodes, consensusType);
+
+        taskMode[taskId] = TaskMode.Continuous;
+        _continuousInfo[taskId].maxRounds = maxRounds;
+        _continuousInfo[taskId].maxSpendWei = maxSpendWei;
+        _continuousInfo[taskId].active = true;
+        _continuousInfo[taskId].roundsTriggered = 1;
+        _continuousInfo[taskId].totalSpent = roundCost;
+        _continuousInfo[taskId].roundTaskIds.push(taskId);
+
+        return taskId;
+    }
+
+    /**
+     * @notice Start the next round of a continuous task.
+     * @param parentTaskId The task ID returned by submitTaskContinuous.
+     * @dev   Caller must send exactly rewardPerNode * requiredNodes ETH.
+     *        The previous round must be Completed before this can be called.
+     */
+    function triggerNextRound(uint256 parentTaskId)
+        external payable nonReentrant whenNotPaused returns (uint256)
+    {
+        ContinuousInfo storage info = _continuousInfo[parentTaskId];
+        require(info.active, "Not a continuous task or stopped");
+        require(info.roundsTriggered < info.maxRounds, "Max rounds reached");
+
+        uint256 lastTaskId = info.roundTaskIds[info.roundTaskIds.length - 1];
+        Task storage lastTask = tasks[lastTaskId];
+        require(lastTask.status == TaskStatus.Completed, "Previous round not complete");
+        require(lastTask.requester == msg.sender, "Only requester can trigger next round");
+
+        uint256 roundCost = lastTask.rewardPerNode * lastTask.requiredNodes;
+        require(info.totalSpent + roundCost <= info.maxSpendWei, "Would exceed maxSpendWei");
+        require(msg.value >= roundCost, "Insufficient payment");
+
+        // Duration of previous round (reuse same window)
+        uint256 duration = lastTask.deadline - lastTask.createdAt;
+
+        taskCount++;
+        uint256 newTaskId = taskCount;
+        uint256 newRound = info.roundsTriggered + 1;
+
+        tasks[newTaskId] = Task({
+            id: newTaskId,
+            requester: lastTask.requester,
+            modelHash: lastTask.modelHash,
+            inputHash: lastTask.inputHash,
+            modelRequirements: lastTask.modelRequirements,
+            rewardPerNode: lastTask.rewardPerNode,
+            requiredNodes: lastTask.requiredNodes,
+            claimedCount: 0,
+            submittedCount: 0,
+            deadline: block.timestamp + duration,
+            status: TaskStatus.Pending,
+            consensusType: lastTask.consensusType,
+            createdAt: block.timestamp,
+            consensusResult: bytes32(0)
+        });
+
+        activeTaskCount++;
+        taskMode[newTaskId] = TaskMode.Continuous;
+        continuousParent[newTaskId] = parentTaskId;
+
+        info.roundTaskIds.push(newTaskId);
+        info.roundsTriggered++;
+        info.totalSpent += roundCost;
+
+        if (msg.value > roundCost) {
+            (bool success, ) = msg.sender.call{value: msg.value - roundCost}("");
+            require(success, "Refund failed");
+        }
+
+        emit TaskCreated(newTaskId, lastTask.requester, lastTask.modelHash, lastTask.rewardPerNode, lastTask.requiredNodes, lastTask.consensusType);
+        emit ContinuousTaskTriggered(parentTaskId, newTaskId, newRound);
+
+        return newTaskId;
+    }
+
+    /**
+     * @notice Stop a continuous task from being re-triggered (requester or owner).
+     */
+    function stopContinuousTask(uint256 parentTaskId) external {
+        require(
+            tasks[parentTaskId].requester == msg.sender || owner() == msg.sender,
+            "Not authorized"
+        );
+        require(_continuousInfo[parentTaskId].active, "Not an active continuous task");
+        _continuousInfo[parentTaskId].active = false;
+    }
+
+    // ============ Continuous View Functions ============
+
+    function getTaskMode(uint256 taskId) external view returns (TaskMode) {
+        return taskMode[taskId];
+    }
+
+    function getContinuousInfo(uint256 taskId) external view returns (
+        uint256 maxRounds,
+        uint256 roundsTriggered,
+        uint256 maxSpendWei,
+        uint256 totalSpent,
+        bool active,
+        uint256[] memory roundTaskIds
+    ) {
+        ContinuousInfo storage info = _continuousInfo[taskId];
+        return (
+            info.maxRounds,
+            info.roundsTriggered,
+            info.maxSpendWei,
+            info.totalSpent,
+            info.active,
+            info.roundTaskIds
+        );
     }
 
     // ============ Admin Functions ============
