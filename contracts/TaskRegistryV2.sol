@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 // ============ Interfaces ============
 
@@ -152,6 +153,13 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
     address public protocolFeeCollector;
     uint256 public protocolFeeBps = 200; // 2% in basis points
 
+    // #126 — COMP secondary utility: researchers pay in COMP at a discount
+    // compDiscountBps: discount applied to requester (e.g. 1000 = 10% off total COMP cost)
+    // taskCompRewardPerNode: set for COMP-funded tasks; nodes receive COMP instead of ETH
+    bool public compPaymentEnabled = false;
+    uint256 public compDiscountBps = 1000; // 10% discount for COMP payers
+    mapping(uint256 => uint256) public taskCompRewardPerNode; // 0 = ETH task, >0 = COMP task
+
     // #129/#130 — Optional NFT/SBT minters (set after deployment)
     address public resultNFTContract;
     address public reproducibilitySBTContract;
@@ -219,6 +227,10 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
     event ResultNFTContractUpdated(address indexed newContract);
     event ReproducibilitySBTContractUpdated(address indexed newContract);
     event ProtocolFeeCollectorUpdated(address indexed newCollector);
+
+    // #126
+    event TaskCreatedWithCOMP(uint256 indexed taskId, address indexed requester, uint256 compRewardPerNode, uint256 compPaid);
+    event COMPRewardDistributed(uint256 indexed taskId, address indexed node, uint256 compAmount);
 
     event ContinuousTaskTriggered(
         uint256 indexed parentTaskId,
@@ -308,6 +320,67 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
             deadline,
             ConsensusType.Majority
         );
+    }
+
+    /**
+     * @notice Submit a task paying the reward pool in COMP tokens at a 10% discount.
+     * @dev #126 — COMP secondary utility.
+     *      rewardPerNode is denominated in COMP wei (18 decimals).
+     *      Requester pays (rewardPerNode * requiredNodes) * (10000 - compDiscountBps) / 10000 COMP.
+     *      The discount stays in the contract (withdrawable by owner).
+     *      Nodes receive rewardPerNode COMP each upon consensus.
+     */
+    function submitTaskWithCOMP(
+        bytes32 modelHash,
+        bytes32 inputHash,
+        string calldata modelRequirements,
+        uint256 rewardPerNode,
+        uint256 requiredNodes,
+        uint256 deadline,
+        ConsensusType consensusType
+    ) external nonReentrant whenNotPaused returns (uint256) {
+        require(compPaymentEnabled, "COMP payment not enabled");
+        require(modelHash != bytes32(0), "Invalid model hash");
+        require(requiredNodes >= 3, "Need at least 3 nodes for consensus");
+        require(requiredNodes <= 100, "Too many nodes");
+        require(deadline > block.timestamp, "Invalid deadline");
+        require(rewardPerNode > 0, "Reward must be > 0");
+
+        uint256 totalPool = rewardPerNode * requiredNodes;
+        uint256 discount  = totalPool * compDiscountBps / 10000;
+        uint256 compPaid  = totalPool - discount; // requester pays less; discount stays in contract
+
+        require(
+            IERC20(tokenReward).transferFrom(msg.sender, address(this), compPaid),
+            "COMP transfer failed"
+        );
+
+        taskCount++;
+        uint256 taskId = taskCount;
+
+        tasks[taskId] = Task({
+            id: taskId,
+            requester: msg.sender,
+            modelHash: modelHash,
+            inputHash: inputHash,
+            modelRequirements: modelRequirements,
+            rewardPerNode: 0, // ETH reward is zero; COMP stored separately
+            requiredNodes: requiredNodes,
+            claimedCount: 0,
+            submittedCount: 0,
+            deadline: deadline,
+            status: TaskStatus.Pending,
+            consensusType: consensusType,
+            createdAt: block.timestamp,
+            consensusResult: bytes32(0)
+        });
+
+        taskCompRewardPerNode[taskId] = rewardPerNode; // marks this as a COMP task
+        activeTaskCount++;
+
+        emit TaskCreated(taskId, msg.sender, modelHash, rewardPerNode, requiredNodes, consensusType);
+        emit TaskCreatedWithCOMP(taskId, msg.sender, rewardPerNode, compPaid);
+        return taskId;
     }
 
     /**
@@ -527,26 +600,43 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
 
         // INTERACTIONS: External calls AFTER all state changes
         uint256 baseDistributed = 0;
+        uint256 compRewardPerNode = taskCompRewardPerNode[taskId]; // 0 = ETH task
+        bool isCompTask = compRewardPerNode > 0;
+
         for (uint256 i = 0; i < nodeCount; i++) {
             address node = nodesToReward[i];
-            uint256 payout = rewardPerNode + bonuses[i];
-            (bool success, ) = node.call{value: payout}("");
-            if (success) {
-                baseDistributed += rewardPerNode;
-                emit RewardDistributed(taskId, node, payout, true);
-                if (bonuses[i] > 0) {
-                    emit MultiplierBonusPaid(taskId, node, bonuses[i]);
-                }
-            } else if (bonuses[i] > 0) {
-                // Return unspent bonus to pool if the send failed
-                multiplierPool += bonuses[i];
-            }
 
-            // #140: record matching result in reputation registry (non-critical)
-            if (reputationRegistry != address(0)) {
-                try INodeReputation(reputationRegistry).recordResult(
-                    node, true, success ? payout : 0
-                ) {} catch {}
+            if (isCompTask) {
+                // #126 — COMP task: pay nodes in COMP, skip ETH multiplier bonus
+                bool sent = IERC20(tokenReward).transfer(node, compRewardPerNode);
+                if (sent) {
+                    baseDistributed += compRewardPerNode;
+                    emit COMPRewardDistributed(taskId, node, compRewardPerNode);
+                    emit RewardDistributed(taskId, node, compRewardPerNode, true);
+                }
+                if (reputationRegistry != address(0)) {
+                    try INodeReputation(reputationRegistry).recordResult(
+                        node, true, sent ? compRewardPerNode : 0
+                    ) {} catch {}
+                }
+            } else {
+                // ETH task (original flow)
+                uint256 payout = rewardPerNode + bonuses[i];
+                (bool success, ) = node.call{value: payout}("");
+                if (success) {
+                    baseDistributed += rewardPerNode;
+                    emit RewardDistributed(taskId, node, payout, true);
+                    if (bonuses[i] > 0) {
+                        emit MultiplierBonusPaid(taskId, node, bonuses[i]);
+                    }
+                } else if (bonuses[i] > 0) {
+                    multiplierPool += bonuses[i];
+                }
+                if (reputationRegistry != address(0)) {
+                    try INodeReputation(reputationRegistry).recordResult(
+                        node, true, success ? payout : 0
+                    ) {} catch {}
+                }
             }
         }
 
@@ -561,7 +651,19 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
             }
         }
 
-        // #125 — Collect protocol fee (2%) from unused budget before refunding requester
+        if (isCompTask) {
+            // Refund unused COMP (slots not filled) back to requester
+            uint256 totalCompPool = compRewardPerNode * requiredNodes;
+            uint256 compRemaining = totalCompPool > baseDistributed ? totalCompPool - baseDistributed : 0;
+            if (compRemaining > 0) {
+                IERC20(tokenReward).transfer(requester, compRemaining);
+            }
+            emit TaskCompleted(taskId, baseDistributed);
+            // Skip ETH protocol fee for COMP tasks
+            return;
+        }
+
+        // #125 — Collect protocol fee (2%) from unused ETH budget before refunding requester
         uint256 totalBudget = rewardPerNode * requiredNodes;
         uint256 remaining = totalBudget > baseDistributed ? totalBudget - baseDistributed : 0;
         uint256 protocolFee = 0;
@@ -926,6 +1028,26 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
     function fundMultiplierPool() external payable onlyOwner {
         require(msg.value > 0, "Must send ETH");
         multiplierPool += msg.value;
+    }
+
+    // ============ COMP Payment Admin (#126) ============
+
+    /// @notice Enable or disable COMP payment mode for task submission.
+    function setCompPaymentEnabled(bool enabled) external onlyOwner {
+        compPaymentEnabled = enabled;
+    }
+
+    /// @notice Set the discount for researchers paying in COMP (max 3000 = 30%).
+    function setCompDiscountBps(uint256 _discountBps) external onlyOwner {
+        require(_discountBps <= 3000, "Discount too high (max 30%)");
+        compDiscountBps = _discountBps;
+    }
+
+    /// @notice Withdraw accumulated COMP discount balance to owner.
+    function withdrawCOMPBalance() external onlyOwner {
+        uint256 bal = IERC20(tokenReward).balanceOf(address(this));
+        require(bal > 0, "No COMP balance");
+        require(IERC20(tokenReward).transfer(msg.sender, bal), "Transfer failed");
     }
 
     // ============ View Helpers (used by WetLabOracle #147) ============
