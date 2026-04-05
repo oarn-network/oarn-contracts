@@ -5,7 +5,31 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 
-// ============ Interface ============
+// ============ Interfaces ============
+
+interface IResultNFT {
+    function mintOnConsensus(
+        uint256 taskId,
+        bytes32 modelHash,
+        bytes32 resultHash,
+        address requester,
+        uint256 consensusNodes,
+        bool wetLabAnchored
+    ) external returns (uint256 tokenId);
+}
+
+interface IReproducibilitySBT {
+    function mintToNode(
+        uint256 taskId,
+        bytes32 resultHash,
+        address node,
+        bool wetLabAnchored
+    ) external returns (uint256 tokenId);
+}
+
+interface IProtocolFee {
+    function receiveFee(uint256 taskId) external payable;
+}
 
 interface INodeReputation {
     /// @notice Returns a node's score (0–100) and tier ("New"/"Bronze"/…/"Platinum").
@@ -124,6 +148,14 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
     /// ETH pool funded by the owner; used to pay the 1.2× multiplier bonus to high-rep nodes.
     uint256 public multiplierPool;
 
+    // #124/#125 — Protocol fee (2%) sent to ProtocolFee contract on each completed task
+    address public protocolFeeCollector;
+    uint256 public protocolFeeBps = 200; // 2% in basis points
+
+    // #129/#130 — Optional NFT/SBT minters (set after deployment)
+    address public resultNFTContract;
+    address public reproducibilitySBTContract;
+
     // Consensus thresholds (in basis points, 10000 = 100%)
     uint256 public majorityThreshold = 5001;      // >50%
     uint256 public superMajorityThreshold = 6667; // >66.67%
@@ -182,6 +214,11 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
         uint256 fundingAmount,
         uint256 newRewardPerNode
     );
+
+    event ProtocolFeeCollected(uint256 indexed taskId, uint256 amount);
+    event ResultNFTContractUpdated(address indexed newContract);
+    event ReproducibilitySBTContractUpdated(address indexed newContract);
+    event ProtocolFeeCollectorUpdated(address indexed newCollector);
 
     event ContinuousTaskTriggered(
         uint256 indexed parentTaskId,
@@ -524,12 +561,53 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
             }
         }
 
-        // Refund unused base budget to requester
+        // #125 — Collect protocol fee (2%) from unused budget before refunding requester
         uint256 totalBudget = rewardPerNode * requiredNodes;
-        if (baseDistributed < totalBudget) {
-            uint256 refund = totalBudget - baseDistributed;
-            (bool success, ) = requester.call{value: refund}("");
+        uint256 remaining = totalBudget > baseDistributed ? totalBudget - baseDistributed : 0;
+        uint256 protocolFee = 0;
+        if (remaining > 0 && protocolFeeCollector != address(0) && protocolFeeBps > 0) {
+            protocolFee = (totalBudget * protocolFeeBps) / 10000;
+            if (protocolFee > remaining) protocolFee = remaining;
+            remaining -= protocolFee;
+            try IProtocolFee(protocolFeeCollector).receiveFee{value: protocolFee}(taskId) {
+                emit ProtocolFeeCollected(taskId, protocolFee);
+            } catch {
+                // Non-critical: return fee to remaining if collector fails
+                remaining += protocolFee;
+                protocolFee = 0;
+            }
+        }
+
+        // Refund remainder to requester
+        if (remaining > 0) {
+            (bool success, ) = requester.call{value: remaining}("");
             // Non-critical: don't revert if refund fails
+        }
+
+        // #129 — Mint Result NFT to requester (non-critical)
+        if (resultNFTContract != address(0)) {
+            Task storage t2 = tasks[taskId];
+            try IResultNFT(resultNFTContract).mintOnConsensus(
+                taskId,
+                t2.modelHash,
+                t2.consensusResult,
+                requester,
+                nodeCount,
+                false // wetLabAnchored set externally by WetLabOracle integration
+            ) {} catch {}
+        }
+
+        // #130 — Mint Reproducibility SBT to each consensus-matching node (non-critical)
+        if (reproducibilitySBTContract != address(0)) {
+            Task storage t3 = tasks[taskId];
+            for (uint256 i = 0; i < nodeCount; i++) {
+                try IReproducibilitySBT(reproducibilitySBTContract).mintToNode(
+                    taskId,
+                    t3.consensusResult,
+                    nodesToReward[i],
+                    false
+                ) {} catch {}
+            }
         }
 
         emit TaskCompleted(taskId, baseDistributed);
@@ -819,6 +897,26 @@ contract TaskRegistryV2 is Ownable, ReentrancyGuard, Pausable {
      */
     function setReputationRegistry(address registry) external onlyOwner {
         reputationRegistry = registry;
+    }
+
+    /// @notice Set ResultNFT contract — minted to task requester on consensus (#129)
+    function setResultNFTContract(address _contract) external onlyOwner {
+        resultNFTContract = _contract;
+        emit ResultNFTContractUpdated(_contract);
+    }
+
+    /// @notice Set ReproducibilitySBT contract — minted to consensus nodes (#130)
+    function setReproducibilitySBTContract(address _contract) external onlyOwner {
+        reproducibilitySBTContract = _contract;
+        emit ReproducibilitySBTContractUpdated(_contract);
+    }
+
+    /// @notice Set ProtocolFee collector and fee rate (#125)
+    function setProtocolFeeCollector(address _collector, uint256 _feeBps) external onlyOwner {
+        require(_feeBps <= 500, "Fee too high (max 5%)");
+        protocolFeeCollector = _collector;
+        protocolFeeBps = _feeBps;
+        emit ProtocolFeeCollectorUpdated(_collector);
     }
 
     /**
